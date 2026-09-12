@@ -52,6 +52,7 @@ from .libraries import (
 from .clients import QBittorrent, QbitConfig, Romm, RommConfig
 from . import hub  # ROM Hub bridge -- the Cartridge plugin layer
 from .dat import DatIndex, parse_dat
+from .titled import TitleDBIndex, build_index as build_titled_index, validate_switch_rom
 from .downloaders import (
     CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig, build_client,
     hand_off, merge_secrets, pick_client, redact,
@@ -191,6 +192,9 @@ def _find_dats(root: "Path") -> tuple[list["Path"], str]:
     Returns the paths and, when the scan stopped early, a sentence saying so --
     silence would leave an operator wondering why only some of their DATs
     loaded.
+
+    Also finds .zip archives containing DAT files, since NoIntro distributes
+    their DATs as ZIP files.
     """
     import os
 
@@ -221,7 +225,7 @@ def _find_dats(root: "Path") -> tuple[list["Path"], str]:
             # warnings that look like a problem and are not.
             if lowered in ("gamelist.xml", "miximages.xml"):
                 continue
-            if lowered.endswith((".dat", ".xml")):
+            if lowered.endswith((".dat", ".xml", ".zip")):
                 found.append(here / name)
     return sorted(found), ""
 
@@ -1753,7 +1757,7 @@ class ROMarr:
             # DAT verification is the thing that separates ROMarr from a
             # downloader, and the status page had no way to say whether it was
             # on. Get Started could therefore only ever report DATs as not set
-            # up, however many were loaded.
+            # up, not many were loaded.
             # Without a libarchive bsdtar, every 7z and rar import fails on a
             # format it cannot open -- which is how the disc platforms ship.
             # The live install this was found on had been missing it silently.
@@ -1761,6 +1765,7 @@ class ROMarr:
             "dats": len(self.dats.dats),
             "dat_names": [d.name for d in self.dats.dats if d.name],
             "dat_games": sum(len(d.games) for d in self.dats.dats),
+            "titled": getattr(self, 'titled', None) and len(getattr(self, 'titled', TitleDBIndex()).titles) or 0,
             "play_routes": self.play_route_counts(),
             "stream_url": self.store.settings.get("_stream_url", ""),
             "moonlight": self.moonlight_status(),
@@ -1780,7 +1785,12 @@ class ROMarr:
         day one, and it must not turn every import into an error -- the index
         simply answers `unknown`, which is a real verdict rather than a
         failure.
+
+        Handles both standalone .dat/.xml files and .zip archives containing
+        DAT files (NoIntro distributes their DATs as ZIP files).
         """
+        import zipfile
+
         self.dats = DatIndex()
         self.store.settings["dat_path"] = str(directory or "")
         if not directory:
@@ -1791,10 +1801,33 @@ class ROMarr:
             return {"loaded": 0, "path": str(root),
                     "error": f"{root} is not a directory"}
         found, stopped = _find_dats(root)
+        loaded_count = 0
         for path in found:
             try:
-                self.dats.add(parse_dat(path.read_text(encoding="utf-8",
-                                                       errors="replace")))
+                # Handle ZIP archives containing DAT files
+                if path.suffix.lower() == ".zip":
+                    try:
+                        with zipfile.ZipFile(path, 'r') as zf:
+                            # Look for .dat or .xml files inside the zip
+                            dat_names = [n for n in zf.namelist() 
+                                        if n.lower().endswith(('.dat', '.xml'))
+                                        and not n.startswith('__MACOSX/')
+                                        and not n.startswith('.')]
+                            for dat_name in dat_names:
+                                with zf.open(dat_name) as dat_file:
+                                    content = dat_file.read().decode('utf-8', errors='replace')
+                                    parsed = parse_dat(content)
+                                    if parsed.games:
+                                        self.dats.add(parsed)
+                                        loaded_count += 1
+                    except (zipfile.BadZipFile, OSError) as zip_err:
+                        log.warning("could not read zip %s: %s", path, zip_err)
+                        continue
+                else:
+                    # Regular .dat or .xml file
+                    self.dats.add(parse_dat(path.read_text(encoding="utf-8",
+                                                           errors="replace")))
+                    loaded_count += 1
             except (OSError, ValueError) as exc:
                 log.warning("could not read %s: %s", path, exc)
         log.info("loaded %d DAT(s) from %s", len(self.dats.dats), root)
@@ -1803,7 +1836,27 @@ class ROMarr:
         if stopped:
             result["truncated"] = stopped
             log.warning("DAT scan stopped early: %s", stopped)
+        
+        # Also initialize TitleDB for Switch validation
+        self.reload_titled()
+        
         return result
+    
+    def reload_titled(self) -> dict:
+        """Initialize TitleDB index for Nintendo Switch validation.
+        
+        TitleDB provides title metadata for Switch games since NoIntro/Redump
+        do not publish Switch DAT files.
+        """
+        try:
+            self.titled = build_titled_index()
+            count = len(self.titled.titles) if self.titled else 0
+            log.info("TitleDB index loaded with %d Switch titles", count)
+            return {"loaded": count, "status": "ok"}
+        except Exception as exc:
+            log.warning("TitleDB initialization failed: %s", exc)
+            self.titled = TitleDBIndex()
+            return {"loaded": 0, "status": "error", "error": str(exc)}
 
     def reload_policy(self) -> None:
         """Rebuild the operator's selection policy and notification fan-out.
