@@ -52,6 +52,7 @@ from .libraries import (
 from .clients import QBittorrent, QbitConfig, Romm, RommConfig
 from . import hub  # ROM Hub bridge -- the Cartridge plugin layer
 from .dat import DatIndex, parse_dat
+from .decompress import run_batch as run_decompress_batch, scan_compressed
 from .titled import TitleDBIndex, build_index as build_titled_index, validate_switch_rom
 from .downloaders import (
     CLIENT_TYPES, NZBGet, NzbgetConfig, SABnzbd, SabConfig, build_client,
@@ -1844,15 +1845,20 @@ class ROMarr:
     
     def reload_titled(self) -> dict:
         """Initialize TitleDB index for Nintendo Switch validation.
-        
-        TitleDB provides title metadata for Switch games since NoIntro/Redump
-        do not publish Switch DAT files.
+
+        TitleDB provides the title catalogue for Switch games since
+        NoIntro/Redump publish no Switch DAT. Best-effort by design: the
+        fetch is cached on disk under ROMARR_DATA/titledb and every failure
+        mode degrades to an empty index that answers "not in database"
+        rather than stopping startup. Names (a 90MB region file) stay off
+        unless TITLED_NAMES=1 -- see titled.py for the reasoning.
         """
         try:
             self.titled = build_titled_index()
             count = len(self.titled.titles) if self.titled else 0
-            log.info("TitleDB index loaded with %d Switch titles", count)
-            return {"loaded": count, "status": "ok"}
+            log.info("TitleDB index loaded with %d Switch title IDs", count)
+            return {"loaded": count, "names": self.titled.names_loaded,
+                    "status": "ok"}
         except Exception as exc:
             log.warning("TitleDB initialization failed: %s", exc)
             self.titled = TitleDBIndex()
@@ -4025,7 +4031,58 @@ class ROMarr:
                     ("y" if len(self.game_libraries) == 1 else "ies")
             msg = f"{counted} games across {where}"
             return {"message": msg + ("; " + ", ".join(failed) if failed else "")}
+        if name == "Decompress":
+            return self.decompress_batch()
         return {"error": f"unknown command: {name}"}
+
+    def decompress_batch(self, directory: str = "", *,
+                         delete_originals: bool = False,
+                         dry_run: bool = False) -> dict:
+        """Batch decompression: extract, validate against DATs, then delete.
+
+        The workflow issue #22 asked for. Compressatorium does the extraction
+        (CHD, RVZ, Z3DS, NSZ, CSO, 7z, zip -- every format it speaks); ROMarr
+        does the verification, because ROMarr holds the DAT index and the
+        question "is this the published dump" is answered here, not by the
+        extractor.
+
+        Deletion is off by default and gated on verification: a file is
+        deleted only when every output it produced matched a DAT entry.
+        An "unknown" output is kept -- no DAT does not mean bad file, and
+        deleting on unknown would destroy homebrew and translations.
+        """
+        root = directory or str(self.store.settings.get("decompress_path") or "")
+        if not root:
+            return {"error": "no directory given -- pass 'directory' in the "
+                             "request body or set decompress_path in settings"}
+        url = self._env.get("COMPRESSATORIUM_URL", "")
+        if not url and not dry_run:
+            return {"error": "COMPRESSATORIUM_URL is not configured. Start a "
+                             "compressatorium container (pacnpal/compressatorium) "
+                             "and set the variable, or run with dry_run=true "
+                             "to see what would be processed."}
+        report = run_decompress_batch(
+            root,
+            compressatorium_url=url,
+            compressatorium_api_key=self._env.get("COMPRESSATORIUM_API_KEY", ""),
+            dats=self.dats,
+            delete_originals=bool(delete_originals),
+            dry_run=bool(dry_run),
+        )
+        result = report.to_dict()
+        # Recorded as an event so the History page shows the run, like every
+        # other destructive operation here does.
+        self.store.record(Event(
+            kind="decompress", game=f"batch: {root}",
+            platform="",
+            detail=(f"scanned={result['scanned']} "
+                    f"decompressed={result['decompressed']} "
+                    f"verified={result['verified']} "
+                    f"kept={result['kept']} "
+                    f"failed={result['failed']} "
+                    f"deleted={result['deleted']}"
+                    + (" (dry run)" if dry_run else ""))))
+        return result
 
     def import_finished(self, *, retry_failed: bool = True) -> list[dict]:
         """Import anything the download client has completed.
@@ -5413,6 +5470,15 @@ def make_handler(service: ROMarr):
                 name = (body.get("name") or "").strip()
                 if not name:
                     return self._json(400, {"error": "name is required"})
+                # The Decompress command takes options in the body: which
+                # directory, whether to delete originals after verification,
+                # and whether this is a dry run. Every other command keeps its
+                # no-argument shape.
+                if name == "Decompress":
+                    return self._json(200, service.decompress_batch(
+                        str(body.get("directory") or ""),
+                        delete_originals=bool(body.get("delete_originals")),
+                        dry_run=bool(body.get("dry_run"))))
                 return self._json(200, service.run_command(name))
             return self._json(404, {"error": "not found"})
 

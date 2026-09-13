@@ -100,6 +100,26 @@ services:
       # download-only. Everything works without it, minus those routes.
       # STREAM_SERVER_URL: http://romm-stream:8090
 
+      # Optional DAT directory. Loose .dat/.xml files AND the ZIP archives
+      # No-Intro distributes are read. Mount the host directory below and
+      # point this at the container path.
+      # DAT_PATH: /dats
+
+      # Optional Compressatorium service, for the Decompress task: batch
+      # decompress a compressed library, verify every output against the
+      # DATs, delete only the originals that verified. The library must be
+      # mounted into BOTH containers at the same path.
+      # https://github.com/pacnpal/compressatorium
+      # COMPRESSATORIUM_URL: http://compressatorium:8080
+      # COMPRESSATORIUM_API_KEY: ""
+
+      # Switch validation via TitleDB. On by default (1.7MB, cached). Set
+      # TITLED_NAMES: "1" to also load title names -- a 65-95MB region file,
+      # cached on disk, costing seconds of parse time and a few hundred MB
+      # of RAM, which is why it stays opt-in.
+      # TITLED_NAMES: "1"
+      # TITLED_REGION: US.en
+
       LOG_LEVEL: INFO
 
     volumes:

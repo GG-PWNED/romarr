@@ -3736,7 +3736,12 @@ RENDER.tasks=async()=>{
     :s%3600===0?`every ${s/3600} h`
     :s%60===0?`every ${s/60} min`:`every ${s} s`;
   const scheduled=(d.items||[]).map(t=>[t.name,t.label,t]);
-  const manualOnly=[['RefreshLibrary','Re-read the library from RomM',null]];
+  const manualOnly=[['RefreshLibrary','Re-read the library from RomM',null],
+    ['Decompress','Batch decompress the library: extract via Compressatorium, '
+     +'verify every output against the DATs. Originals are deleted only when '
+     +'they verified AND the API call asked for deletion — this button never '
+     +'deletes. Needs COMPRESSATORIUM_URL and decompress_path set in '
+     +'settings.',null]];
   $('#page').innerHTML=`<div class="card"><h3>Tasks</h3>
     <p class="help">The service runs these on its own clock &mdash; intervals live
       under Settings &rarr; General. Run starts one now regardless.</p>
@@ -3753,10 +3758,17 @@ RENDER.tasks=async()=>{
       </tr>`).join('')}</tbody></table></div>`;
   document.querySelectorAll('[data-task]').forEach(b=>b.onclick=async()=>{
     b.disabled=true; b.textContent='Running…';
+    // Decompress from the Tasks page is always a dry run: extraction is
+    // minutes-to-hours of service work and a mis-click must not start it on
+    // the whole library. The real run is an API call with an explicit
+    // directory -- and only that call can authorise deletion.
+    const body={name:b.dataset.task};
+    if(b.dataset.task==='Decompress') body.dry_run=true;
     const r=await j('/api/v1/command',{method:'POST',
       headers:{'content-type':'application/json'},
-      body:JSON.stringify({name:b.dataset.task})});
-    toast(r.message||'Done'); go('tasks'); refreshCounts();
+      body:JSON.stringify(body)});
+    toast(r.message||(r.scanned!==undefined?`Scanned ${r.scanned} (dry run)`:'Done'));
+    go('tasks'); refreshCounts();
   });
 };
 

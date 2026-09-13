@@ -296,7 +296,12 @@ def test_adding_platforms_did_not_move_an_existing_one():
     assert resolve("snes").slug == "snes"
     assert resolve("Sega Mega Drive/Genesis").slug == "genesis-slash-megadrive"
     assert resolve("Commodore C64/128/MAX").slug == "c64"
-    assert resolve("Nintendo Switch") is None
+    # Switch WAS unmodelled and answered None; it is now its own platform
+    # (issue #23). The invariant this test guards is that adding it did not
+    # move anything else -- including the NES alias "nintendo" that Switch's
+    # name contains, which must still answer NES and never switch.
+    assert resolve("Nintendo Switch").slug == "switch"
+    assert resolve("nintendo").slug == "nes"
     assert resolve("Amstrad PCW") is None
     assert platforms.by_slug("wii").max_size == 12 * 1024 ** 3
 

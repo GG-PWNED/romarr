@@ -430,6 +430,11 @@ request actually came through it.
 | `ROMARR_PLAYERS` | no | Which browser players to offer, best first: `emulatorjs,ruffle,jsdos,emularity`. All four when unset; `none` turns every browser route off |
 | `ROMARR_JSDOS_URL` / `ROMARR_EMULARITY_URL` | no | Where your own js-dos and Emularity live. Without one, ROMarr reports that the player *would* run a file and names the setting that would let it link there |
 | `ROMARR_DATA` | no | Path to the state file |
+| `DAT_PATH` | no | Directory of No-Intro / Redump DATs. Loose `.dat`/`.xml` files **and** the ZIP archives No-Intro distributes are read, including one level down beside the platform they describe. Point it at a DAT directory, not at your ROM library |
+| `COMPRESSATORIUM_URL` | no | A [Compressatorium](https://github.com/pacnpal/compressatorium) service, for the Decompress task: batch decompress a compressed library, verify every output against the DATs, and delete only the originals that verified. The library must be mounted into both containers at the same path |
+| `COMPRESSATORIUM_API_KEY` | no | Bearer token, when Compressatorium has `COMPRESSATORIUM_ENABLE_AUTH=true` |
+| `TITLED_NAMES` | no | `1` loads Switch title names from TitleDB — a 65-95MB region file, cached on disk, costing seconds of parse and a few hundred MB of RAM. Off by default; the 1.7MB ID catalogue loads either way |
+| `TITLED_REGION` | no | Which TitleDB region file `TITLED_NAMES=1` loads (default `US.en`) |
 | `PUID` / `PGID` / `UMASK` / `TZ` | Docker | Process user, group, new-file permission mask, timezone |
 
 ¹ Not required for `LIBRARY_KIND=folder`, which needs only `LIBRARY_PATH`.

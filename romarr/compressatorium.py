@@ -1,0 +1,387 @@
+"""Compressatorium client for batch ROM decompression.
+
+Compressatorium (github.com/pacnpal/compressatorium) is the service that does
+the actual extraction: CHD, RVZ/WIA/GCZ, Z3DS, NSZ, CSO/ZSO/DAX, WUX, NKit,
+and plain 7z/zip archives. ROMarr owns the DAT index and therefore the verdict
+-- "is the decompressed file the published dump" is answered here, not by the
+extractor.
+
+The API contract below is read from the service's own source (app/models.py,
+app/routes/convert.py, app/routes/dat.py at tag v4.5.0-beta-3), not guessed:
+
+  * POST   /api/jobs          one job: {file_path, mode, output_dir, ...}
+  * POST   /api/jobs/batch    many files, ONE mode per call
+  * GET    /api/jobs          list every job
+  * GET    /api/jobs/{id}     one job's status
+  * DELETE /api/jobs/{id}     cancel a job
+  * POST   /api/dat/match     {path} -> {matched, ...} for one file
+  * GET    /health            unauthenticated liveness
+
+A job is created with a `mode` -- the ConversionMode enum value naming which
+tool runs. There is no "decompress whatever this is" mode, so this module
+maps file extensions to modes itself and groups a batch by mode, because
+/api/jobs/batch takes one mode for every file in the call.
+
+Auth, when the service enables it, accepts a bearer token; the header name
+is `Authorization: Bearer <token>` (the service also reads
+`X-Compressatorium-Token`, but bearer is the form its own docs use).
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import requests
+
+log = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------- config --
+
+@dataclass(frozen=True)
+class CompressatoriumConfig:
+    """Connection settings for one Compressatorium instance."""
+
+    base_url: str
+    api_key: str = ""
+    timeout: int = 60
+    # Health checks get a short budget so a status page never hangs on a
+    # decompression server that is mid-job on a 12GB disc image.
+    health_timeout: int = 5
+
+
+# ------------------------------------------------------------ mode map --
+
+#: Extension -> ConversionMode value for decompression.
+#:
+#: Checked in order, longest-suffix first, because `.nkit.iso` must win over
+#: `.iso` -- and `.iso` is deliberately absent: a plain ISO is not compressed
+#: and there is nothing to do.
+_MODE_BY_SUFFIX: tuple[tuple[str, str], ...] = (
+    (".nkit.iso", "nkit_restore"),
+    (".nkit.gcz", "nkit_restore"),
+    # 3DS -- the z-prefixed forms are compressed; .cci/.cxi/.cia are not.
+    (".z3ds", "z3ds_decompress"),
+    (".zcci", "z3ds_decompress"),
+    (".zcia", "z3ds_decompress"),
+    (".zcxi", "z3ds_decompress"),
+    (".z3dsx", "z3ds_decompress"),
+    # Switch
+    (".nsz", "nsz_decompress"),
+    (".xcz", "nsz_decompress"),
+    # PSP / PS2 CSO family
+    (".cso", "cso_decompress"),
+    (".zso", "cso_decompress"),
+    (".dax", "cso_decompress"),
+    # Wii U
+    (".wux", "jwud_decompress"),
+    # Dolphin disc images -> ISO
+    (".rvz", "dolphin_iso"),
+    (".wia", "dolphin_iso"),
+    (".gcz", "dolphin_iso"),
+    # CHD -> the raw disc image. `extractcd` is the mode that reproduces the
+    # source disc (cue+bin for multi-track, iso for single-track) -- the same
+    # bytes Redump catalogues.
+    (".chd", "extractcd"),
+    # General archives
+    (".7z", "romz_extract"),
+    (".zip", "romz_extract"),
+)
+
+#: Statuses the service reports on a ConversionJob.
+QUEUED = "queued"
+PROCESSING = "processing"
+COMPLETED = "completed"
+FAILED = "failed"
+CANCELLED = "cancelled"
+
+_TERMINAL = frozenset({COMPLETED, FAILED, CANCELLED})
+
+
+def mode_for(filename: str) -> str:
+    """The decompression mode for a file, or "" when it is not compressed.
+
+    Suffix rather than content: Compressatorium itself picks tools by
+    extension, and sniffing a 12GB image to decide which tool to hand it to
+    would read the whole file before doing any work.
+    """
+    lowered = str(filename or "").lower()
+    for suffix, mode in _MODE_BY_SUFFIX:
+        if lowered.endswith(suffix):
+            return mode
+    return ""
+
+
+# ------------------------------------------------------------- results --
+
+@dataclass(frozen=True)
+class JobResult:
+    """One ConversionJob as the service reports it.
+
+    `output_path` is a single path -- for a disc image that is the file
+    produced; for an archive extraction it is the directory the contents
+    were written into. The caller walks it either way.
+    """
+
+    job_id: str
+    status: str = ""
+    file_path: str = ""
+    mode: str = ""
+    output_path: str = ""
+    error: str = ""
+    progress: int = 0
+
+    @property
+    def terminal(self) -> bool:
+        return self.status in _TERMINAL
+
+
+@dataclass(frozen=True)
+class MatchResult:
+    """What /api/dat/match said about one file."""
+
+    path: str
+    matched: bool = False
+    game: str = ""
+    dat: str = ""
+    detail: str = ""
+
+
+# -------------------------------------------------------------- client --
+
+class CompressatoriumClient:
+    """Talk to a Compressatorium service.
+
+    Every method returns a structured result rather than raising on a
+    server-side failure: a rejected job or an unmatched file is an answer to
+    display, not an exception to recover from. Network failures are logged
+    and surfaced as empty results so the caller can tell "the server said
+    no" from "there was no server".
+    """
+
+    name = "Compressatorium"
+
+    def __init__(self, config: CompressatoriumConfig,
+                 session: requests.Session | None = None):
+        self._config = config
+        self._session = session or requests.Session()
+
+    @property
+    def configured(self) -> bool:
+        return bool(self._config.base_url)
+
+    def _url(self, path: str) -> str:
+        return f"{self._config.base_url.rstrip('/')}/{path.lstrip('/')}"
+
+    def _headers(self) -> dict[str, str]:
+        if self._config.api_key:
+            return {"Authorization": f"Bearer {self._config.api_key}"}
+        return {}
+
+    # --------------------------------------------------------- health --
+
+    def reachable(self) -> bool:
+        """Whether the service answers at all. /health needs no auth."""
+        if not self.configured:
+            return False
+        try:
+            response = self._session.get(
+                self._url("/health"), timeout=self._config.health_timeout)
+            return response.ok
+        except requests.RequestException as err:
+            log.warning("compressatorium unreachable: %s", err.__class__.__name__)
+            return False
+
+    def health(self) -> dict[str, Any]:
+        """The server's health payload for a status page."""
+        if not self.configured:
+            return {"ok": False, "error": "not configured"}
+        try:
+            response = self._session.get(
+                self._url("/health"), headers=self._headers(),
+                timeout=self._config.health_timeout)
+            if not response.ok:
+                return {"ok": False, "error": f"status {response.status_code}"}
+            payload = response.json() if response.content else {}
+            if isinstance(payload, dict):
+                payload.setdefault("ok", True)
+                return payload
+            return {"ok": True, "detail": payload}
+        except requests.RequestException as err:
+            log.warning("compressatorium health check failed: %s", err)
+            return {"ok": False, "error": str(err)}
+        except ValueError:
+            return {"ok": False, "error": "invalid response"}
+
+    # ------------------------------------------------------ job calls --
+
+    def submit_job(self, *, file_path: str, mode: str,
+                   output_dir: str | None = None,
+                   duplicate_action: str = "skip",
+                   delete_on_verify: bool = False) -> JobResult:
+        """Queue one conversion job.
+
+        `delete_on_verify` is left False by default even when the caller
+        wants originals deleted: ROMarr verifies against its own DAT index
+        and deletes only what passed, rather than trusting the service's
+        own verify pass. Two independent checks agreeing is the point --
+        the service deletes on ITS verification, ROMarr on ROMarr's.
+        """
+        if not self.configured:
+            return JobResult(job_id="", error="not configured")
+        if not mode:
+            return JobResult(job_id="", error=f"no decompression mode for "
+                                              f"{file_path!r}")
+        body: dict[str, Any] = {
+            "file_path": file_path,
+            "mode": mode,
+            "duplicate_action": duplicate_action,
+            "delete_on_verify": bool(delete_on_verify),
+        }
+        if output_dir:
+            body["output_dir"] = output_dir
+        try:
+            response = self._session.post(
+                self._url("/api/jobs"), json=body,
+                headers=self._headers(), timeout=self._config.timeout)
+        except requests.RequestException as err:
+            log.warning("compressatorium submit failed: %s", err)
+            return JobResult(job_id="", error=str(err))
+        return self._parse_job(response)
+
+    def job_status(self, job_id: str) -> JobResult:
+        """How one job is doing. An unknown job reads status="unknown"."""
+        if not job_id:
+            return JobResult(job_id="", status="unknown", error="no job id")
+        if not self.configured:
+            return JobResult(job_id=job_id, status="unknown",
+                             error="not configured")
+        try:
+            response = self._session.get(
+                self._url(f"/api/jobs/{job_id}"), headers=self._headers(),
+                timeout=self._config.timeout)
+        except requests.RequestException as err:
+            log.warning("compressatorium status check failed: %s", err)
+            return JobResult(job_id=job_id, status="unknown", error=str(err))
+        if response.status_code == 404:
+            return JobResult(job_id=job_id, status="unknown",
+                             error="job not found")
+        return self._parse_job(response)
+
+    def cancel_job(self, job_id: str) -> bool:
+        """Cancel a job. The service's verb is DELETE on the job route."""
+        if not job_id or not self.configured:
+            return False
+        try:
+            response = self._session.delete(
+                self._url(f"/api/jobs/{job_id}"), headers=self._headers(),
+                timeout=self._config.timeout)
+        except requests.RequestException as err:
+            log.warning("compressatorium cancel failed: %s", err)
+            return False
+        if not response.ok:
+            log.warning("compressatorium cancel rejected %s: %s",
+                        job_id, response.status_code)
+            return False
+        return True
+
+    def wait_for_jobs(self, job_ids: list[str], *, timeout: int = 3600,
+                      poll_interval: int = 5) -> dict[str, JobResult]:
+        """Poll every job until terminal or the deadline passes.
+
+        Returns the last known state of each job. A job still running at the
+        deadline is returned as-is rather than cancelled -- the service keeps
+        working on it and the caller can ask again later, which matters when
+        a 12GB disc image outlives the patience of one HTTP request.
+        """
+        results: dict[str, JobResult] = {}
+        pending = list(job_ids)
+        deadline = time.monotonic() + timeout
+        while pending and time.monotonic() < deadline:
+            still: list[str] = []
+            for job_id in pending:
+                status = self.job_status(job_id)
+                results[job_id] = status
+                if not status.terminal:
+                    still.append(job_id)
+            pending = still
+            if pending:
+                time.sleep(poll_interval)
+        return results
+
+    # --------------------------------------------------- DAT matching --
+
+    def match_file(self, path: str) -> MatchResult:
+        """Ask the service to match one file against the DATs IT has loaded.
+
+        This is a second opinion alongside ROMarr's own DatIndex, not a
+        replacement: Compressatorium has embedded-hash matching for CHD and
+        Dolphin formats that a naive file hash cannot answer, which is the
+        one thing its DAT store does that ROMarr's does not.
+        """
+        if not self.configured:
+            return MatchResult(path=path, detail="not configured")
+        try:
+            response = self._session.post(
+                self._url("/api/dat/match"), json={"path": path},
+                headers=self._headers(), timeout=self._config.timeout)
+        except requests.RequestException as err:
+            log.warning("compressatorium dat match failed: %s", err)
+            return MatchResult(path=path, detail=str(err))
+        if not response.ok:
+            return MatchResult(path=path,
+                               detail=f"status {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError:
+            return MatchResult(path=path, detail="invalid response")
+        if not isinstance(payload, dict):
+            return MatchResult(path=path, detail="unexpected response shape")
+        return MatchResult(
+            path=path,
+            matched=bool(payload.get("matched")),
+            game=str(payload.get("game_name") or payload.get("name") or ""),
+            dat=str(payload.get("dat_name") or payload.get("dat") or ""),
+            detail=str(payload.get("detail") or ""),
+        )
+
+    # ------------------------------------------------------------ parse --
+
+    def _parse_job(self, response: requests.Response) -> JobResult:
+        """A ConversionJob response -> JobResult, including error paths."""
+        if not response.ok:
+            detail = _truncate(response.text, 200)
+            log.warning("compressatorium rejected request: %s %s",
+                        response.status_code, detail)
+            return JobResult(job_id="", error=f"status {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError:
+            return JobResult(job_id="", error="invalid response")
+        if not isinstance(payload, dict):
+            return JobResult(job_id="", error="unexpected response shape")
+        job_id = str(payload.get("id") or payload.get("job_id") or "")
+        if not job_id:
+            return JobResult(job_id="", error="server returned no job id")
+        return JobResult(
+            job_id=job_id,
+            status=str(payload.get("status") or QUEUED),
+            file_path=str(payload.get("file_path") or ""),
+            mode=str(payload.get("mode") or ""),
+            output_path=str(payload.get("output_path") or ""),
+            error=str(payload.get("error_message") or ""),
+            progress=int(payload.get("progress") or 0),
+        )
+
+
+# --------------------------------------------------------------- helpers --
+
+def _truncate(text: str, limit: int) -> str:
+    """A response body, shortened so a log line stays readable."""
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."

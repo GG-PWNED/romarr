@@ -66,13 +66,19 @@ def test_unknown_platform_is_none_not_a_guess():
 def test_a_machine_we_do_not_model_resolves_to_nothing():
     """A shorter alias must not swallow the longer name that contains it.
 
-    "Nintendo Switch" contains "nintendo" (an NES alias) and "PlayStation
-    Vita" contains "playstation" (a PSX alias). Neither machine is modelled
-    here, so the only correct answer is None -- 2,874 Switch rows and 34 Vita
-    rows were answering as NES and PS1.
+    "PlayStation Vita" contains "playstation" (a PSX alias). The machine is
+    not modelled here, so the only correct answer is None -- 34 Vita rows
+    were answering as PS1. "Nintendo Switch" is the same trap against the
+    NES alias "nintendo", and it is asserted separately below because Switch
+    IS now modelled: it must resolve to its own platform, never to NES.
     """
-    assert resolve("Nintendo Switch") is None
     assert resolve("PlayStation Vita") is None
+    # Switch is modelled (issue #23): its name contains "nintendo", an NES
+    # alias, so the resolution has to reach the switch platform and not the
+    # shorter prefix. 2,874 Switch rows were answering as NES before the
+    # platform existed, and would answer as NES again if this regressed.
+    assert resolve("Nintendo Switch").slug == "switch"
+    assert resolve("switch").slug == "switch"
 
 
 def test_the_64dd_is_not_a_nintendo_64():
@@ -628,7 +634,12 @@ def test_every_platform_declares_a_ceiling_matched_to_its_medium():
         # mode digital does not have.
         "digital": 300 * GB,
     }
-    big_cards = {"nds", "3ds"}
+    # Cards one order past the cartridge-era norm. Capped per platform
+    # because the ceiling differs by an order of magnitude between them:
+    # NDS and 3DS topped out at 8GB, while Switch shipped 32GB cards -- so
+    # a single number would either reject real Switch dumps or admit four
+    # times the largest NDS/3DS game ever made.
+    big_cards = {"nds": 8 * GB, "3ds": 8 * GB, "switch": 32 * GB}
     # Blu-ray, one medium past every disc the DISC limit was written for: a
     # PS3 dual-layer disc is 50GB and the biggest title in the catalogue
     # measures 44.8GB, so a 16GB ceiling would reject the platform's own
@@ -637,7 +648,7 @@ def test_every_platform_declares_a_ceiling_matched_to_its_medium():
     for p in PLATFORMS:
         assert p.max_size > 0, p.slug
         if p.slug in big_cards:
-            assert p.max_size <= 8 * GB, p.slug
+            assert p.max_size <= big_cards[p.slug], p.slug
             continue
         if p.slug in big_discs:
             assert p.max_size <= big_discs[p.slug], p.slug
