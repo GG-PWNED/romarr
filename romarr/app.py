@@ -104,7 +104,7 @@ from .ui import login_page as ui_login_page
 
 log = logging.getLogger(__name__)
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 # What ROMarr labels its own downloads with, so its jobs are distinguishable
 # from everything else in a shared client -- the same reason Radarr and Sonarr
@@ -1955,7 +1955,7 @@ class ROMarr:
     def retire_dead_downloads(self) -> dict:
         """Blocklist downloads that died, then grab the next best release.
 
-        The Blocklist has existed since 0.6 and nothing ever added to it on
+        The Blocklist has existed since 0.7 and nothing ever added to it on
         its own, which made a failed download a loop: `best_release` is
         deterministic, so removing the dead torrent by hand and letting the
         next sweep run scored the same results the same way and grabbed the

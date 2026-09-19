@@ -131,18 +131,43 @@ is a fact about bytes rather than a taste in bitrates.
 
 ### The clock
 
-![The Tasks page: five scheduled jobs with their intervals and last results](docs/img/tasks.png)
+![The Tasks page: the scheduled jobs with their intervals and last results](docs/img/tasks.png)
 
-Five jobs run without you: completed downloads import **every minute**;
+Six jobs run without you: completed downloads import **every minute**;
 the Wanted list is re-searched every 12 hours with a **per-title backoff
 ladder** (4h → 7 days, so a game that isn't dumped yet doesn't get your
 tracker account banned); indexer **RSS feeds are watched hourly** in
 between, so a release that appears an hour after you asked is grabbed
-within the hour; lists sync every 6; and once a day ROMarr asks GitHub if a
-newer version exists — and *tells* you, because an *arr that updates itself
-is an *arr that restarts mid-import. Every RSS match goes through the same
+within the hour; lists sync every 6; dead downloads are retired every 15
+minutes (below); and once a day ROMarr asks GitHub if a newer version
+exists — and *tells* you, because an *arr that updates itself is an *arr
+that restarts mid-import. Every RSS match goes through the same
 scorer as a search: the feed can never grab what a search would refuse.
 Intervals are editable live; zero disables a job.
+
+### When a download dies
+
+A stalled torrent used to be a loop. The Blocklist existed, nothing ever
+added to it, and `best_release` is deterministic — so pulling the dead
+torrent out of your client and waiting for the next sweep scored the same
+results the same way and grabbed **the same dead file again**.
+
+Now a download the client refused, one that finished with no ROM in it, or
+one still unfinished past `stalled_timeout_minutes` (default three hours) is
+blocklisted **with the reason attached**, the game goes back on Wanted, and
+the next best release is grabbed in its place. Capped at three replacement
+grabs per sweep, because each one costs a full indexer search and twenty at
+once is how a tracker decides you are a scraper.
+
+What is deliberately *not* blocklisted: `no download client configured`.
+That failure is your install's, not the release's — and a blocklist full of
+good torrents blocked because a client was missing is worse than no
+blocklist at all.
+
+And a request you no longer want can now simply be dropped: **Remove** on
+any Wanted row, or `DELETE /api/v1/wanted/missing`. Until now the only way
+off that list was an import, so a typo went on costing an indexer search on
+every sweep and every RSS pass, forever, for a game that does not exist.
 
 ### Lists, and the accounts that feed them
 
@@ -217,10 +242,10 @@ Auth is on by default (password + optional TOTP, API keys, ForwardAuth SSO
 behind Authentik/Authelia); native HTTPS via `ROMARR_SSL_CERT`/`KEY`; the
 **Logs** page tails the actual process log live; backups strip credentials
 before they leave; Prometheus metrics and an OpenAPI spec for everything;
-remote path mapping for clients on other hosts; and history, wanted, shelf
-and settings all survive restarts. Prowlarr's API keys never reach a
-browser or a log, archives cannot zip-slip out of the library root, and an
-existing ROM is never silently overwritten.
+remote path mapping for clients on other hosts; and history, wanted, the
+download queue, shelf and settings all survive restarts. Prowlarr's API
+keys never reach a browser or a log, archives cannot zip-slip out of the
+library root, and an existing ROM is never silently overwritten.
 
 ## Requirements
 
