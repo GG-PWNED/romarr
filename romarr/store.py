@@ -25,7 +25,7 @@ import logging
 import os
 import tempfile
 import threading
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,19 @@ class StateUnreadable(RuntimeError):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _rows(raw: Any, cls: type) -> list:
+    """Rebuild stored dicts into dataclasses, ignoring fields we do not know.
+
+    `cls(**row)` raises TypeError on a key this version has never heard of,
+    and that is a state file which cannot be loaded -- an install that will
+    not boot because it was once run by a newer ROMarr. Dropping the unknown
+    key loses the field and keeps the service.
+    """
+    known = {f.name for f in dataclass_fields(cls)}
+    return [cls(**{k: v for k, v in row.items() if k in known})
+            for row in (raw or []) if isinstance(row, dict)]
 
 
 @dataclass
@@ -77,6 +90,43 @@ class WantedItem:
     # `attempts` it drives the re-search backoff, so a title that has failed
     # for months is retried weekly rather than hourly.
     searched_at: str = ""
+
+
+@dataclass
+class QueueItem:
+    """One download ROMarr is waiting on -- what *arr calls Activity.
+
+    This used to live only in the service object, so a restart emptied
+    Activity while the download client carried happily on seeding. Losing the
+    rows lost the only record of which *game* a finished torrent belongs to:
+    the import sweep matches a completed download to its queue row by release
+    title, so after a restart it could no longer tell that
+    `Super.Metroid.USA.zip` was the SNES request from an hour ago, and skipped
+    the file it had just finished downloading.
+    """
+
+    game: str
+    platform: str
+    release: str
+    seeders: int
+    state: str                # queued | grabbed | imported | failed
+    detail: str = ""
+    at: str = field(default_factory=now_iso)
+    # Identity of the release this row took, as profiles.release_id computes
+    # it -- the infohash when the link carried one. Stored so a dead download
+    # can be blocklisted by the same identity a later search will compute,
+    # without persisting the download URL, which carries the indexer API key.
+    release_id: str = ""
+    indexer: str = ""
+    size: int = 0
+    # Whether a failure is the *release's* fault. "qBittorrent rejected it"
+    # and "the archive held no ROMs" are; "no download client configured" is
+    # not, and blocklisting a release because the operator has not set up a
+    # client yet would punish the release for somebody else's mistake.
+    release_fault: bool = False
+    # Set once this row's release has been blocklisted, so the sweep that
+    # retires dead downloads never does it twice.
+    blocklisted: bool = False
 
 
 # Defaults are spelled out here rather than scattered through the UI so a fresh
@@ -151,6 +201,18 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Behaviour
     "auto_import": True,
     "rescan_after_import": True,
+    # Failed download handling, the same idea Radarr and Sonarr have: a
+    # release that could not be downloaded is not one to choose again. When
+    # on, a download that the client refused, that finished with no ROMs in
+    # it, or that stalled is added to the blocklist and the next best release
+    # is grabbed in its place. Without this the next missing/RSS sweep re-runs
+    # the same scorer over the same results and picks the same dead file.
+    "blocklist_failed_downloads": True,
+    # How long a grabbed download may sit without finishing before it counts
+    # as stalled, in minutes. 0 disables stall detection entirely, leaving
+    # only outright failures to be retired. Generous by default: a large disc
+    # image on a thin swarm is slow, not dead.
+    "stalled_timeout_minutes": 180,
     # The clock. Zero disables a job; the scheduler reads these live, so a
     # change applies at the next tick without a restart.
     #
@@ -174,6 +236,11 @@ class Store:
     # Past this the history file grows without bound and nobody reads the tail.
     MAX_EVENTS = 2000
 
+    # The queue is live state, not a log: rows leave it when they import or
+    # are cleared. The cap is a backstop against a runaway sweep filling the
+    # state file, not an expected working size.
+    MAX_QUEUE = 500
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._lock = threading.RLock()
@@ -185,6 +252,7 @@ class Store:
         self.settings: dict[str, Any] = copy.deepcopy(DEFAULT_SETTINGS)
         self.events: list[Event] = []
         self.wanted: list[WantedItem] = []
+        self.queue: list[QueueItem] = []
         self.load()
 
     # -- persistence -------------------------------------------------------
@@ -225,8 +293,12 @@ class Store:
             # Merged rather than replaced, so a setting added in a later
             # version has its default instead of being absent.
             self.settings = {**copy.deepcopy(DEFAULT_SETTINGS), **(raw.get("settings") or {})}
-            self.events = [Event(**e) for e in raw.get("events", []) if isinstance(e, dict)]
-            self.wanted = [WantedItem(**w) for w in raw.get("wanted", []) if isinstance(w, dict)]
+            self.events = _rows(raw.get("events"), Event)
+            self.wanted = _rows(raw.get("wanted"), WantedItem)
+            # Absent in files written before the queue was persisted, which is
+            # simply an empty queue -- the same thing those installs had after
+            # every restart anyway.
+            self.queue = _rows(raw.get("queue"), QueueItem)
 
     def save(self) -> None:
         with self._lock:
@@ -234,6 +306,7 @@ class Store:
                 "settings": self.settings,
                 "events": [asdict(e) for e in self.events[-self.MAX_EVENTS:]],
                 "wanted": [asdict(w) for w in self.wanted],
+                "queue": [asdict(q) for q in self.queue[-self.MAX_QUEUE:]],
             }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic: a crash mid-write would otherwise leave truncated JSON and
@@ -294,6 +367,18 @@ class Store:
             self.save()
         return changed
 
+    def unwant(self, game: str, platform: str) -> bool:
+        """Drop a request nobody wants any more.
+
+        The same removal `fulfil` performs, deliberately kept apart from it:
+        fulfil means "this arrived", and the two are not the same event to
+        anybody reading History later. Without this the only way off the
+        Wanted list was an import, so a misspelled request cost an indexer
+        search on every missing sweep and every RSS pass, forever, for a game
+        that does not exist.
+        """
+        return self.fulfil(game, platform)
+
     def missing(self) -> list[dict]:
         with self._lock:
             return [asdict(w) for w in self.wanted]
@@ -321,6 +406,27 @@ class Store:
                     item.searched_at = now_iso()
                     break
         self.save()
+
+    # -- queue (Activity) ---------------------------------------------------
+
+    def enqueue(self, item: QueueItem) -> QueueItem:
+        """Add one row to the queue and write it down."""
+        with self._lock:
+            self.queue.append(item)
+            if len(self.queue) > self.MAX_QUEUE:
+                del self.queue[: len(self.queue) - self.MAX_QUEUE]
+        self.save()
+        return item
+
+    def set_queue(self, items) -> None:
+        """Replace the whole queue -- what remove, retry and clear do."""
+        with self._lock:
+            self.queue = list(items)
+        self.save()
+
+    def queue_rows(self) -> list[dict]:
+        with self._lock:
+            return [asdict(q) for q in self.queue]
 
     # -- per-game shelf state ------------------------------------------------
     #
