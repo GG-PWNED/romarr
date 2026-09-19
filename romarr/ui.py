@@ -1211,10 +1211,14 @@ RENDER.missing=async()=>{
       <span style="color:var(--dim);font-size:12.5px">
         ${d.items.length} game(s) requested but not yet imported</span></div>
     ${d.items.length?`<table><thead><tr><th>Game</th><th>Platform</th>
-      <th>Added</th><th>Attempts</th><th>Last error</th></tr></thead><tbody>
+      <th>Added</th><th>Attempts</th><th>Last error</th><th></th></tr></thead><tbody>
       ${d.items.map(w=>`<tr><td>${esc(w.game)}</td><td>${esc(w.platform)}</td>
         <td>${esc(w.added.slice(0,10))}</td><td>${w.attempts}</td>
-        <td style="color:var(--dim)">${esc(w.last_error||'—')}</td></tr>`).join('')}
+        <td style="color:var(--dim)">${esc(w.last_error||'—')}</td>
+        <td><button class="mini" data-drop-game="${esc(w.game)}"
+          data-drop-platform="${esc(w.platform)}"
+          title="Stop looking for this. It stays out of Wanted until you ask for it again."
+          >Remove</button></td></tr>`).join('')}
       </tbody></table>`:'<div class="empty">Nothing missing.</div>'}`;
   const b=$('#w-all'); if(b) b.onclick=async()=>{
     b.disabled=true; b.textContent='Searching…';
@@ -1224,6 +1228,17 @@ RENDER.missing=async()=>{
     toast(`Searched ${r.searched??0}, grabbed ${r.grabbed??0}`);
     go('missing'); refreshCounts();
   };
+  // Dropping a request, which Wanted could not do at all: the list was only
+  // ever emptied by an import, so a typo went on being searched for forever.
+  $('#page').querySelectorAll('button[data-drop-game]').forEach(x=>x.onclick=async()=>{
+    const game=x.dataset.dropGame, platform=x.dataset.dropPlatform;
+    if(!confirm(`Stop looking for "${game}" on ${platform}?`)) return;
+    x.disabled=true;
+    const r=await fetch('/api/v1/wanted/missing?game='+encodeURIComponent(game)
+      +'&platform='+encodeURIComponent(platform),{method:'DELETE'});
+    if(r.ok){ toast(`Removed ${game}`); go('missing'); refreshCounts(); }
+    else { x.disabled=false; toast('Could not remove that request'); }
+  });
 };
 
 RENDER.lists=async()=>{

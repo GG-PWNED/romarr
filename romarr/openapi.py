@@ -42,7 +42,11 @@ DESCRIPTIONS: dict[str, tuple[str, str]] = {
                             "many rows are cached and browsable right now. "
                             "Filterable by platform, genre, region, decade, "
                             "origin and source."),
-    "/api/v1/wanted/missing": ("GET", "Games wanted but not yet found."),
+    "/api/v1/wanted/missing": ("GET", "Games wanted but not yet found. DELETE "
+                                      "the same path with game and platform "
+                                      "-- as query parameters or a JSON body "
+                                      "-- to drop a request without importing "
+                                      "it."),
     "/api/v1/queue": ("GET", "Active downloads."),
     "/api/queue": ("GET", "Active downloads (legacy path)."),
     "/api/v1/history": ("GET", "What ROMarr has done."),

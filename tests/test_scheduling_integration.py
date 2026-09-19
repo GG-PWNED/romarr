@@ -21,7 +21,16 @@ def test_the_service_registers_its_jobs(tmp_path):
     s = svc(tmp_path)
     names = {j["name"] for j in s.scheduler.status()}
     assert names == {"ImportCompleted", "MissingGameSearch", "RssSync",
-                     "ListSync", "UpdateCheck", "HashIndex"}
+                     "ListSync", "UpdateCheck", "HashIndex", "FailedDownloads"}
+
+
+def test_turning_off_failed_download_handling_disables_its_job_live(tmp_path):
+    s = svc(tmp_path)
+    jobs = {j["name"]: j for j in s.scheduler.status()}
+    assert jobs["FailedDownloads"]["enabled"]
+    s.store.update_settings({"blocklist_failed_downloads": False})
+    jobs = {j["name"]: j for j in s.scheduler.status()}
+    assert not jobs["FailedDownloads"]["enabled"]
 
 
 def test_turning_off_auto_import_disables_the_job_live(tmp_path):

@@ -144,11 +144,29 @@ class Blocklist:
         self._entries: dict[str, dict] = {}
 
     def add(self, release, reason: str = "") -> dict:
+        return self.add_entry(
+            release_id(release),
+            title=getattr(release, "title", ""),
+            indexer=getattr(release, "indexer", ""),
+            size=getattr(release, "size", 0),
+            reason=reason)
+
+    def add_entry(self, entry_id: str, *, title: str = "", indexer: str = "",
+                  size: int = 0, reason: str = "") -> dict:
+        """Block an identity rather than a release object.
+
+        A dead download is retired long after the `Release` that started it
+        has been forgotten -- all that survives is the queue row. The row
+        carries the id `release_id` computed at grab time, so blocking by id
+        matches exactly the same thing a later search will compute, which
+        recomputing from a reconstructed object would not: an id taken from
+        an infohash cannot be rebuilt out of a title and a size.
+        """
         entry = {
-            "id": release_id(release),
-            "title": getattr(release, "title", ""),
-            "indexer": getattr(release, "indexer", ""),
-            "size": getattr(release, "size", 0),
+            "id": str(entry_id),
+            "title": title,
+            "indexer": indexer,
+            "size": size,
             "reason": reason or "blocked by the operator",
             "blocked_at": int(time.time()),
         }

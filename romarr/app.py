@@ -97,7 +97,7 @@ LIST_SECRETS = ("api_key", "openxbl_key", "npsso", "itchio_key",
                 "battlenet_cookie", "humble_cookie")
 from .scheduler import Scheduler, next_search_due
 from .selection import best_release, judge, score
-from .store import Event, Store
+from .store import Event, QueueItem, Store
 from .ui import page as ui_page
 from .ui import link_page as ui_link_page
 from .ui import login_page as ui_login_page
@@ -151,15 +151,9 @@ def category_for(env: dict[str, str], client: str) -> str:
     return env.get(f"{client}_CATEGORY") or DEFAULT_CATEGORY
 
 
-@dataclass
-class QueueItem:
-    game: str
-    platform: str
-    release: str
-    seeders: int
-    state: str                # queued | grabbed | imported | failed
-    detail: str = ""
-    at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
+# QueueItem is defined in .store, beside the other things that survive a
+# restart, and re-exported here because that is where callers have always
+# imported it from.
 
 
 #: How deep the DAT scan walks, and how many directory entries it will look at
@@ -336,7 +330,6 @@ class ROMarr:
         # pluggable library; ROMM_LIBRARY still works, the same way LIBRARY_URL
         # falls back to ROMM_URL, so no existing install has to be edited.
         self.library = Path(e.get("LIBRARY_PATH") or e.get("ROMM_LIBRARY", "/mnt/roms"))
-        self.queue: list[QueueItem] = []
         # Releases offered by a search, keyed by search then by release id, so
         # the Search page can grab one without ever being handed a download URL
         # carrying Prowlarr's API key.
@@ -619,6 +612,13 @@ class ROMarr:
             "RssSync", "Watch indexer feeds for wanted games",
             _minutes("rss_sync_interval_minutes"),
             self.rss_sync)
+        # Often enough that a dead grab is replaced the same evening, rarely
+        # enough that the replacement searches it triggers are not a hammering.
+        self.scheduler.add(
+            "FailedDownloads", "Retire dead downloads and grab a replacement",
+            lambda: (900 if self.store.settings.get(
+                "blocklist_failed_downloads", True) else 0),
+            lambda: self.retire_dead_downloads()["message"])
         self.scheduler.add(
             "ListSync", "Sync import lists into Wanted",
             _hours("list_sync_interval_hours"),
@@ -1367,7 +1367,8 @@ class ROMarr:
             except Exception as err:
                 log.warning("prowlarr search failed for %r: %s", game, err)
                 releases = []
-        pick = best_release(releases, game, platform)
+        pick = best_release(releases, game, platform,
+                           profile=self.profile, blocklist=self.blocklist)
         scored = sorted(
             ((score(r, game, platform), r) for r in releases),
             key=lambda pair: -pair[0])
@@ -1448,12 +1449,12 @@ class ROMarr:
             return {"ok": False, "error": f"unknown platform: {platform_name!r}"}
 
         releases = self._search_releases(game, platform)
-        pick = best_release(releases, game, platform)
+        pick = best_release(releases, game, platform,
+                           profile=self.profile, blocklist=self.blocklist)
         if pick is None:
             item = QueueItem(game, platform.slug, "", 0, "failed",
                              f"no usable release among {len(releases)} result(s)")
-            with self._lock:
-                self.queue.append(item)
+            self.store.enqueue(item)
             self.store.want(game, platform.slug)
             self.store.note_failure(game, platform.slug, item.detail)
             self.store.record(Event(kind="failed", game=game, platform=platform.slug,
@@ -1461,10 +1462,16 @@ class ROMarr:
             return {"ok": False, "error": item.detail}
 
         if not pick.download_url:
+            # The release's own fault, and worth retiring: nothing about the
+            # next sweep would choose differently, so without the blocklist
+            # this result is picked again every twelve hours forever.
             item = QueueItem(game, platform.slug, pick.title, pick.seeders, "failed",
-                             "release offers no usable download link")
-            with self._lock:
-                self.queue.append(item)
+                             "release offers no usable download link",
+                             release_id=release_id(pick),
+                             indexer=getattr(pick, "indexer", ""),
+                             size=getattr(pick, "size", 0),
+                             release_fault=True)
+            self.store.enqueue(item)
             self.store.want(game, platform.slug)
             self.store.note_failure(game, platform.slug, item.detail)
             self.store.record(Event(kind="failed", game=game, platform=platform.slug,
@@ -1483,10 +1490,15 @@ class ROMarr:
         """
         client = pick_client(pick.protocol, self.clients)
         if client is None:
+            # Not the release's fault -- blocklisting it here would punish a
+            # perfectly good torrent because the operator has not set up a
+            # client yet, and the block would outlive the mistake.
             item = QueueItem(game, platform_slug, pick.title, pick.seeders, "failed",
-                             f"no download client configured for {pick.protocol}")
-            with self._lock:
-                self.queue.append(item)
+                             f"no download client configured for {pick.protocol}",
+                             release_id=release_id(pick),
+                             indexer=getattr(pick, "indexer", ""),
+                             size=getattr(pick, "size", 0))
+            self.store.enqueue(item)
             self.store.want(game, platform_slug)
             self.store.note_failure(game, platform_slug, item.detail)
             self.store.record(Event(kind="failed", game=game, platform=platform_slug,
@@ -1500,9 +1512,12 @@ class ROMarr:
         ok = hand_off(client, pick.download_url, name=pick.title)
         item = QueueItem(game, platform_slug, pick.title, pick.seeders,
                          "grabbed" if ok else "failed",
-                         "" if ok else f"{client.name} rejected the release")
-        with self._lock:
-            self.queue.append(item)
+                         "" if ok else f"{client.name} rejected the release",
+                         release_id=release_id(pick),
+                         indexer=getattr(pick, "indexer", ""),
+                         size=getattr(pick, "size", 0),
+                         release_fault=not ok)
+        self.store.enqueue(item)
         if ok:
             self.store.record(Event(kind="grabbed", game=game, platform=platform_slug,
                                     release=pick.title, seeders=pick.seeders,
@@ -1558,7 +1573,9 @@ class ROMarr:
                     "game": game, "platform": platform.slug if platform else None,
                     "items": []}
 
-        judged = [(judge(r, game, platform), r) for r in releases]
+        judged = [(judge(r, game, platform,
+                         profile=self.profile, blocklist=self.blocklist), r)
+                  for r in releases]
         judged.sort(key=lambda pair: (-pair[0].points, pair[1].size))
 
         key = f"{game}|{platform.slug if platform else ''}"
@@ -1864,6 +1881,45 @@ class ROMarr:
             self.titled = TitleDBIndex()
             return {"loaded": 0, "status": "error", "error": str(exc)}
 
+    # -- the queue ----------------------------------------------------------
+
+    @property
+    def queue(self) -> list[QueueItem]:
+        """Activity, which lives in the store so it survives a restart.
+
+        A property rather than a plain list because every caller already says
+        `self.queue`, and a second list kept in step with the stored one by
+        hand is precisely the drift this removes.
+        """
+        return self.store.queue
+
+    @queue.setter
+    def queue(self, items) -> None:
+        self.store.set_queue(items)
+
+    # -- wanted ---------------------------------------------------------------
+
+    def drop_request(self, game: str, platform_name: str) -> bool:
+        """Take something off Wanted without pretending it arrived.
+
+        `fulfil` is what an import calls, and it means the game is in the
+        library now. This is the other reason a request leaves the list -- it
+        was a typo, or you changed your mind -- and somebody reading History
+        later has to be able to tell those apart.
+
+        The platform is resolved so the API is as forgiving as every other
+        one here ("Super Nintendo" and "snes" are the same request), falling
+        back to the raw string so an entry stored under a slug this build no
+        longer recognises can still be removed.
+        """
+        platform = resolve(platform_name)
+        slug = platform.slug if platform is not None else str(platform_name).strip()
+        removed = self.store.unwant(game, slug)
+        if removed:
+            self.store.record(Event(kind="ignored", game=game, platform=slug,
+                                    detail="request dropped"))
+        return removed
+
     def reload_policy(self) -> None:
         """Rebuild the operator's selection policy and notification fan-out.
 
@@ -1881,6 +1937,109 @@ class ROMarr:
         entry = self.blocklist.add(release, reason=reason)
         self.store.put_item("blocklist", entry)
         return entry
+
+    def block_id(self, entry_id: str, *, title: str = "", indexer: str = "",
+                 size: int = 0, reason: str = "") -> dict:
+        """Block one release identity, for callers holding a queue row."""
+        entry = self.blocklist.add_entry(entry_id, title=title, indexer=indexer,
+                                         size=size, reason=reason)
+        self.store.put_item("blocklist", entry)
+        return entry
+
+    #: How many replacement grabs one sweep may make. A dead release is
+    #: retired the moment it is noticed, but every replacement costs a full
+    #: indexer search, and twenty of them at once is how a tracker decides
+    #: ROMarr is a scraper.
+    MAX_REGRABS_PER_SWEEP = 3
+
+    def retire_dead_downloads(self) -> dict:
+        """Blocklist downloads that died, then grab the next best release.
+
+        The Blocklist has existed since 0.6 and nothing ever added to it on
+        its own, which made a failed download a loop: `best_release` is
+        deterministic, so removing the dead torrent by hand and letting the
+        next sweep run scored the same results the same way and grabbed the
+        same dead file again. Retiring the release is the half that makes the
+        retry land somewhere new.
+
+        Three things count as dead, and one thing deliberately does not:
+        a client that refused the release, a download that finished with no
+        ROMs in it, and one that has sat unfinished past the stall timeout.
+        A failure that is the *install's* fault -- no download client
+        configured for the protocol -- is not the release's doing and is left
+        alone, or the operator would come back to a blocklist full of
+        perfectly good torrents.
+        """
+        if not self.store.settings.get("blocklist_failed_downloads", True):
+            return {"blocklisted": 0, "regrabbed": 0,
+                    "message": "failed download handling is off"}
+
+        try:
+            stall_minutes = int(self.store.settings.get("stalled_timeout_minutes") or 0)
+        except (TypeError, ValueError):
+            stall_minutes = 0
+
+        now = datetime.now(timezone.utc)
+        dead: list[QueueItem] = []
+        with self._lock:
+            for row in self.queue:
+                if row.blocklisted or not row.release_id:
+                    continue
+                if row.state in ("failed", "import-failed") and row.release_fault:
+                    dead.append(row)
+                    continue
+                if row.state == "grabbed" and stall_minutes > 0:
+                    age = self._row_age_minutes(row, now)
+                    if age is not None and age >= stall_minutes:
+                        row.state = "failed"
+                        row.release_fault = True
+                        row.detail = (f"stalled: no import after "
+                                      f"{int(age)} minutes")
+                        dead.append(row)
+
+        blocklisted = 0
+        regrabbed = 0
+        retried: set[tuple[str, str]] = set()
+        for row in dead:
+            reason = row.detail or f"download {row.state}"
+            self.block_id(row.release_id, title=row.release,
+                          indexer=row.indexer, size=row.size,
+                          reason=reason)
+            row.blocklisted = True
+            blocklisted += 1
+            self.store.record(Event(kind="ignored", game=row.game,
+                                    platform=row.platform, release=row.release,
+                                    indexer=row.indexer,
+                                    detail=f"blocklisted -- {reason}"))
+            key = (row.game.lower(), row.platform)
+            if key in retried or regrabbed >= self.MAX_REGRABS_PER_SWEEP:
+                continue
+            retried.add(key)
+            # Back on the Wanted list first: the replacement search can fail
+            # too, and a request that has lost its dead download and never
+            # reached Wanted is one nothing will ever look for again.
+            self.store.want(row.game, row.platform)
+            try:
+                if self.request(row.game, row.platform).get("ok"):
+                    regrabbed += 1
+            except Exception as err:      # one bad row must not stop the rest
+                log.warning("replacement grab for %r failed: %s", row.game, err)
+        self.store.save()
+        message = (f"retired {blocklisted} dead download(s), "
+                   f"grabbed {regrabbed} replacement(s)")
+        return {"blocklisted": blocklisted, "regrabbed": regrabbed,
+                "message": message}
+
+    @staticmethod
+    def _row_age_minutes(row, now) -> float | None:
+        """How long this row has been waiting, or None if it will not say."""
+        try:
+            stamped = datetime.fromisoformat(row.at)
+        except (TypeError, ValueError):
+            return None
+        if stamped.tzinfo is None:
+            stamped = stamped.replace(tzinfo=timezone.utc)
+        return (now - stamped).total_seconds() / 60.0
 
     def unblock(self, entry_id: str) -> bool:
         self.blocklist.remove(entry_id)
@@ -3793,7 +3952,8 @@ class ROMarr:
             platform = resolve(item.platform)
             if platform is None:
                 continue
-            pick = best_release(releases, item.game, platform)
+            pick = best_release(releases, item.game, platform,
+                               profile=self.profile, blocklist=self.blocklist)
             if pick is None or not pick.download_url:
                 continue
             if self.grab(pick, item.game, platform.slug).get("ok"):
@@ -4011,6 +4171,8 @@ class ROMarr:
             return {"imported": done, "message": f"Imported {len(done)}"}
         if name == "RssSync":
             return {"message": self.rss_sync()}
+        if name == "FailedDownloads":
+            return self.retire_dead_downloads()
         if name == "ListSync":
             return self.list_sync()
         if name == "UpdateCheck":
@@ -4101,6 +4263,7 @@ class ROMarr:
                 for item in self.queue:
                     if item.state == "import-failed":
                         item.state = "grabbed"
+            self.store.save()
         results = []
         finished = []
         for client in self.clients:
@@ -4166,6 +4329,11 @@ class ROMarr:
                                 "reason": "no ROMs found", "library": label})
                 if queue_item is not None:
                     queue_item.state = "import-failed"
+                    # The one import failure that is the release's doing: it
+                    # downloaded fine and held no game. A path that does not
+                    # exist or a full disc is the install's problem and must
+                    # not cost the release a place on the blocklist.
+                    queue_item.release_fault = True
                 continue
 
             any_ok = any(o.ok for o in outcomes)
@@ -4195,6 +4363,9 @@ class ROMarr:
             results.append({"name": name, "ok": any_ok,
                             "reason": "" if any_ok else str(outcomes[0].reason),
                             "library": label})
+        # The sweep marks rows in place; without this the marks live only in
+        # memory and a restart re-imports everything it had already done.
+        self.store.save()
         return results
 
 
@@ -5484,6 +5655,34 @@ def make_handler(service: ROMarr):
 
         def _delete(self):
             route = urlparse(self.path)
+            if route.path == "/api/v1/wanted/missing":
+                # Dropping a request, which Wanted could not do: the list was
+                # only ever emptied by an import, so a typo went on costing an
+                # indexer search on every missing sweep and every RSS pass for
+                # a game that does not exist.
+                #
+                # Game and platform may arrive as query parameters or as a
+                # JSON body; a DELETE carrying one is unusual enough that
+                # refusing it would just be a papercut.
+                query = parse_qs(route.query)
+                body = {}
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    try:
+                        body = json.loads(self.rfile.read(length) or b"{}")
+                    except (ValueError, TypeError):
+                        body = {}
+                if not isinstance(body, dict):
+                    body = {}
+                game = str(body.get("game")
+                           or (query.get("game") or [""])[0]).strip()
+                platform = str(body.get("platform")
+                               or (query.get("platform") or [""])[0]).strip()
+                if not game or not platform:
+                    return self._json(400, {
+                        "error": "game and platform are both required"})
+                removed = service.drop_request(game, platform)
+                return self._json(200 if removed else 404, {"deleted": removed})
             if route.path.startswith("/api/v1/blocklist/"):
                 # Lifting a block is a decision, so it is its own verb rather
                 # than a flag on an update -- and the reason the entry carried
