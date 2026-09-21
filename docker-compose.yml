@@ -20,7 +20,7 @@
 
 services:
   romarr:
-    image: ghcr.io/blizzhacker/romarr:latest
+    image: ghcr.io/gg-pwned/romarr:latest
     container_name: romarr
     restart: unless-stopped
     ports:
